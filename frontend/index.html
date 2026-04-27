@@ -1,0 +1,943 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Sudoku OCR Solver — Telegraph Edition</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:ital,wght@0,700;1,500&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
+  <style>
+/* ═══════════════════════════════════════════════════════════
+   TOKENS
+═══════════════════════════════════════════════════════════ */
+:root {
+  --bg:          #0d1117;
+  --bg-card:     #161b22;
+  --bg-raised:   #1c2333;
+  --bg-hover:    #21293a;
+  --border:      rgba(255,255,255,0.07);
+  --border-mid:  rgba(255,255,255,0.13);
+  --border-hi:   rgba(255,255,255,0.22);
+
+  --text:        #e6edf3;
+  --text-2:      #8b949e;
+  --text-3:      #484f58;
+
+  --green:       #3fb950;
+  --green-dim:   rgba(63,185,80,0.14);
+  --green-glow:  rgba(63,185,80,0.32);
+
+  --blue:        #388bfd;
+  --blue-dim:    rgba(56,139,253,0.14);
+  --blue-glow:   rgba(56,139,253,0.32);
+
+  --amber:       #d29922;
+  --amber-dim:   rgba(210,153,34,0.14);
+
+  --red:         #f85149;
+  --red-dim:     rgba(248,81,73,0.14);
+  --red-glow:    rgba(248,81,73,0.32);
+
+  --purple:      #a371f7;
+  --purple-dim:  rgba(163,113,247,0.14);
+
+  --given-bg:    rgba(56,139,253,0.10);
+  --given-fg:    #79c0ff;
+
+  --cell:        52px;
+  --r-xs: 4px; --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-xl: 20px;
+
+  --font:    "Inter", sans-serif;
+  --display: "Playfair Display", serif;
+  --mono:    "JetBrains Mono", monospace;
+
+  --sh-sm: 0 1px 3px rgba(0,0,0,0.4);
+  --sh-md: 0 4px 16px rgba(0,0,0,0.5);
+  --sh-lg: 0 8px 32px rgba(0,0,0,0.6);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RESET
+═══════════════════════════════════════════════════════════ */
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html { font-size:16px; scroll-behavior:smooth; }
+body {
+  background:var(--bg); color:var(--text); font-family:var(--font);
+  min-height:100vh; display:flex; flex-direction:column; align-items:center;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(63,185,80,0.055) 0%, transparent 70%),
+    radial-gradient(ellipse 55% 35% at 85% 85%,  rgba(56,139,253,0.04)  0%, transparent 70%);
+}
+button { font-family:var(--font); }
+
+/* ═══════════════════════════════════════════════════════════
+   HEADER
+═══════════════════════════════════════════════════════════ */
+header {
+  width:100%; padding:0 2rem; height:62px;
+  display:flex; align-items:center; justify-content:space-between;
+  border-bottom:1px solid var(--border);
+  background:rgba(13,17,23,0.88); backdrop-filter:blur(14px);
+  position:sticky; top:0; z-index:100;
+}
+.brand { display:flex; align-items:baseline; gap:10px; }
+.brand-name {
+  font-family:var(--display); font-size:1.35rem; font-weight:700;
+  color:var(--text); letter-spacing:-0.02em;
+}
+.brand-name em { color:var(--green); font-style:italic; }
+.brand-pill {
+  font-size:0.62rem; font-weight:600; letter-spacing:0.12em;
+  text-transform:uppercase; color:var(--text-3);
+  border:1px solid var(--border-mid); padding:2px 8px; border-radius:20px;
+}
+
+/* ── step pills ─────────────────────────────────────────── */
+.steps { display:flex; gap:3px; }
+.step {
+  display:flex; align-items:center; gap:6px;
+  padding:5px 13px; border-radius:20px;
+  font-size:0.7rem; font-weight:500; letter-spacing:0.07em; text-transform:uppercase;
+  border:1px solid transparent; background:transparent;
+  color:var(--text-3); cursor:default; transition:all .2s;
+}
+.step .dot { width:5px; height:5px; border-radius:50%; background:currentColor; opacity:.35; }
+.step.active { background:var(--bg-raised); border-color:var(--border-mid); color:var(--text); }
+.step.active .dot { opacity:1; background:var(--green); }
+.step.done { color:var(--green); }
+.step.done .dot { opacity:1; background:var(--green); }
+
+/* ── OCR mode badge ─────────────────────────────────────── */
+#ocr-badge {
+  display:none; align-items:center; gap:6px; padding:4px 11px;
+  border-radius:20px; font-size:0.66rem; font-weight:600;
+  letter-spacing:0.08em; text-transform:uppercase;
+}
+#ocr-badge.cnn {
+  background:var(--green-dim); border:1px solid var(--green-glow); color:var(--green);
+}
+#ocr-badge.knn {
+  background:var(--amber-dim); border:1px solid var(--amber); color:var(--amber);
+}
+.pulse { width:6px; height:6px; border-radius:50%; background:currentColor;
+         animation:pulse 2s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.45;transform:scale(.65)} }
+
+/* ═══════════════════════════════════════════════════════════
+   MAIN
+═══════════════════════════════════════════════════════════ */
+main { width:100%; max-width:1020px; padding:2.5rem 1.5rem; display:flex; flex-direction:column; gap:2rem; }
+
+.sec-head { display:flex; align-items:center; gap:10px; margin-bottom:1rem; }
+.sec-num {
+  width:22px; height:22px; border-radius:50%; flex-shrink:0;
+  background:var(--bg-raised); border:1px solid var(--border-mid);
+  display:flex; align-items:center; justify-content:center;
+  font-size:0.68rem; font-weight:700; color:var(--green);
+}
+.sec-label {
+  font-size:0.7rem; font-weight:600; letter-spacing:0.1em;
+  text-transform:uppercase; color:var(--text-2);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   UPLOAD PANEL
+═══════════════════════════════════════════════════════════ */
+.drop-zone {
+  border:1.5px dashed var(--border-mid); border-radius:var(--r-xl);
+  padding:2.8rem 2rem; text-align:center; cursor:pointer;
+  background:var(--bg-card); position:relative; overflow:hidden;
+  transition:border-color .25s, transform .15s;
+}
+.drop-zone::before {
+  content:""; position:absolute; inset:0;
+  background:radial-gradient(ellipse 55% 35% at 50% 50%, var(--green-dim) 0%, transparent 68%);
+  opacity:0; transition:opacity .3s; pointer-events:none;
+}
+.drop-zone:hover::before, .drop-zone.drag::before { opacity:1; }
+.drop-zone:hover, .drop-zone.drag { border-color:var(--green); transform:translateY(-2px); }
+.drop-zone input { position:absolute; inset:0; opacity:0; cursor:pointer; z-index:2; }
+
+.dz-icon {
+  width:60px; height:60px; margin:0 auto 1.2rem;
+  border-radius:14px; background:var(--bg-raised); border:1px solid var(--border-mid);
+  display:flex; align-items:center; justify-content:center;
+}
+.dz-icon svg { width:26px; height:26px; stroke:var(--green); fill:none; stroke-width:1.6; }
+.dz-title { font-family:var(--display); font-size:1.25rem; font-weight:700; margin-bottom:5px; }
+.dz-sub   { font-size:0.8rem; color:var(--text-2); margin-bottom:1.4rem; }
+.dz-formats { display:flex; justify-content:center; gap:5px; margin-bottom:1.4rem; }
+.fmt-pill {
+  font-size:0.62rem; font-weight:600; letter-spacing:.07em;
+  padding:2px 7px; border-radius:3px;
+  background:var(--bg-raised); border:1px solid var(--border); color:var(--text-3);
+}
+.dz-cta {
+  display:inline-flex; align-items:center; gap:8px;
+  padding:9px 22px; background:var(--green); color:#0d1117;
+  border:none; border-radius:var(--r-md); font-weight:700; font-size:0.82rem;
+  cursor:pointer; pointer-events:none;
+  box-shadow:0 0 18px var(--green-glow); transition:all .2s;
+}
+.dz-cta svg { width:15px; height:15px; stroke:#0d1117; fill:none; stroke-width:2; }
+
+/* ── status bar ─────────────────────────────────────────── */
+#status {
+  display:flex; align-items:center; gap:10px; padding:10px 15px;
+  border-radius:var(--r-md); font-size:0.78rem; font-weight:500;
+  margin-top:1rem; min-height:40px; border:1px solid transparent; transition:all .3s;
+}
+#status.idle    { background:var(--bg-card); border-color:var(--border); color:var(--text-3); }
+#status.loading { background:var(--amber-dim); border-color:var(--amber); color:var(--amber); }
+#status.success { background:var(--green-dim); border-color:var(--green-glow); color:var(--green); }
+#status.error   { background:var(--red-dim); border-color:var(--red-glow); color:var(--red); }
+.st-icon { flex-shrink:0; display:flex; align-items:center; }
+.st-icon svg { width:15px; height:15px; stroke:currentColor; fill:none; stroke-width:2.2; }
+.spinner {
+  width:13px; height:13px; border:2px solid currentColor;
+  border-top-color:transparent; border-radius:50%;
+  animation:spin .75s linear infinite;
+}
+@keyframes spin { to{transform:rotate(360deg)} }
+
+/* ═══════════════════════════════════════════════════════════
+   BOARD PANEL
+═══════════════════════════════════════════════════════════ */
+#panel-board { display:none; }
+#panel-board.on { display:block; }
+
+.board-wrap { display:flex; gap:1.8rem; align-items:flex-start; flex-wrap:wrap; }
+
+/* ── grid ──────────────────────────────────────────────── */
+.grid-shell {
+  border-radius:var(--r-lg); overflow:hidden;
+  box-shadow:var(--sh-lg), 0 0 0 1px var(--border); flex-shrink:0;
+}
+#grid {
+  display:grid;
+  grid-template-columns:repeat(9, var(--cell));
+  grid-template-rows:   repeat(9, var(--cell));
+  background:var(--bg-card);
+}
+.cell {
+  width:var(--cell); height:var(--cell);
+  display:flex; align-items:center; justify-content:center;
+  font-family:var(--mono); font-size:1.22rem; font-weight:600;
+  background:var(--bg-card); color:var(--text);
+  border-right:1px solid rgba(255,255,255,0.055);
+  border-bottom:1px solid rgba(255,255,255,0.055);
+  cursor:pointer; transition:background .1s;
+  user-select:none; -webkit-tap-highlight-color:transparent;
+  position:relative;
+}
+/* 3×3 box thick borders */
+.cell[data-c="2"],.cell[data-c="5"] { border-right:2px solid rgba(255,255,255,0.18); }
+.cell[data-r="2"],.cell[data-r="5"] { border-bottom:2px solid rgba(255,255,255,0.18); }
+.cell[data-c="8"] { border-right:none; }
+.cell[data-r="8"] { border-bottom:none; }
+
+/* cell states */
+.cell.given     { background:var(--given-bg); color:var(--given-fg); font-weight:700; cursor:default; }
+.cell.user      { color:var(--green); }
+.cell.solved    { color:var(--green); animation:pop .28s cubic-bezier(.34,1.56,.64,1); }
+.cell.selected  { background:var(--blue-dim)!important; outline:2px solid var(--blue); outline-offset:-2px; z-index:2; }
+.cell.peer      { background:rgba(56,139,253,0.045); }
+.cell.conflict  { background:var(--red-dim)!important; color:var(--red)!important; animation:shake .3s ease; }
+.cell.warn      { background:rgba(210,153,34,0.12)!important; color:var(--amber)!important; }
+.cell:not(.given):not(.selected):hover { background:var(--bg-hover); }
+@keyframes pop   { from{transform:scale(.55);opacity:0} to{transform:scale(1);opacity:1} }
+@keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-3px)} 75%{transform:translateX(3px)} }
+
+/* ═══════════════════════════════════════════════════════════
+   RIGHT PANEL — CONTROLS
+═══════════════════════════════════════════════════════════ */
+.ctrl-panel { display:flex; flex-direction:column; gap:1.4rem; flex:1; min-width:190px; }
+
+/* conflict chip */
+#conflict-chip {
+  display:none; align-items:center; gap:8px; padding:8px 13px;
+  border-radius:var(--r-md); font-size:0.76rem; font-weight:600;
+  background:var(--red-dim); border:1px solid rgba(248,81,73,.38); color:var(--red);
+}
+#conflict-chip.on { display:flex; }
+#conflict-chip svg { width:13px; height:13px; stroke:currentColor; fill:none; stroke-width:2.2; flex-shrink:0; }
+
+/* digit count */
+#digit-info {
+  font-size:0.72rem; color:var(--text-3); display:none;
+  padding:6px 0; border-bottom:1px solid var(--border);
+}
+#digit-info.on { display:block; }
+#digit-info strong { color:var(--green); }
+
+/* numpad */
+.numpad { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; }
+.nk {
+  aspect-ratio:1; border:1px solid var(--border-mid); border-radius:var(--r-md);
+  background:var(--bg-card); font-family:var(--mono); font-size:1.1rem; font-weight:600;
+  color:var(--text); cursor:pointer; transition:all .1s;
+  display:flex; align-items:center; justify-content:center;
+}
+.nk:hover { background:var(--bg-hover); border-color:var(--green); color:var(--green); box-shadow:0 0 10px var(--green-dim); }
+.nk:active { transform:scale(.91); }
+.nk.del { font-family:var(--font); font-size:0.7rem; font-weight:700; letter-spacing:.05em; color:var(--text-2); }
+.nk.del:hover { color:var(--red); border-color:var(--red); box-shadow:none; }
+
+/* section sub-label */
+.ctrl-label { font-size:0.68rem; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--text-3); margin-bottom:.55rem; }
+
+/* action buttons */
+.action-col { display:flex; flex-direction:column; gap:7px; }
+.btn {
+  display:flex; align-items:center; gap:9px; padding:10px 16px;
+  border-radius:var(--r-md); font-size:0.8rem; font-weight:500;
+  cursor:pointer; transition:all .13s; width:100%; text-align:left;
+  border:1px solid var(--border-mid); background:var(--bg-card); color:var(--text-2);
+}
+.btn svg { width:14px; height:14px; stroke:currentColor; fill:none; stroke-width:2; flex-shrink:0; }
+.btn:hover { background:var(--bg-hover); color:var(--text); }
+.btn:active { transform:scale(.98); }
+.btn-primary {
+  background:var(--green); color:#0d1117; border-color:var(--green);
+  font-weight:700; font-size:0.86rem; box-shadow:0 0 14px var(--green-glow);
+}
+.btn-primary svg { stroke:#0d1117; }
+.btn-primary:hover { background:#4fc761; color:#0d1117; box-shadow:0 0 22px var(--green-glow); }
+
+/* ── tip box ────────────────────────────────────────────── */
+#tip {
+  display:none; margin-top:.4rem; padding:11px 15px;
+  background:var(--blue-dim); border:1px solid rgba(56,139,253,.28);
+  border-radius:var(--r-md); font-size:0.76rem; color:#79c0ff; line-height:1.65;
+}
+#tip.on { display:block; }
+#tip strong { color:#a5c9ff; }
+
+/* ── solved banner ──────────────────────────────────────── */
+#banner {
+  display:none; margin-top:1.2rem; padding:15px 18px;
+  background:linear-gradient(135deg,rgba(63,185,80,.14),rgba(63,185,80,.04));
+  border:1px solid var(--green-glow); border-radius:var(--r-lg);
+  text-align:center; animation:banner-in .38s cubic-bezier(.34,1.56,.64,1);
+}
+#banner.on { display:block; }
+@keyframes banner-in { from{opacity:0;transform:scale(.95) translateY(8px)} to{opacity:1;transform:scale(1) translateY(0)} }
+.banner-title { font-family:var(--display); font-size:1.25rem; font-style:italic; color:var(--green); margin-bottom:3px; }
+.banner-sub   { font-size:0.76rem; color:var(--text-2); }
+
+/* ── board status (inline under grid) ──────────────────── */
+#board-status {
+  display:flex; align-items:center; gap:9px; padding:9px 14px;
+  border-radius:var(--r-md); font-size:0.78rem; font-weight:500;
+  min-height:38px; margin-top:.9rem; border:1px solid transparent; transition:all .3s;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   IMAGE PANELS (filter stages + binary grid)
+═══════════════════════════════════════════════════════════ */
+#panel-images { display:none; }
+#panel-images.on { display:block; }
+
+.img-panels-grid {
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap:1rem;
+  margin-top:0.5rem;
+}
+
+.img-panel {
+  background:var(--bg-card); border:1px solid var(--border-mid);
+  border-radius:var(--r-lg); overflow:hidden;
+  display:flex; flex-direction:column;
+}
+.img-panel-label {
+  padding:8px 12px; font-size:0.65rem; font-weight:700;
+  letter-spacing:0.1em; text-transform:uppercase;
+  color:var(--text-2); border-bottom:1px solid var(--border);
+  background:var(--bg-raised);
+}
+.img-panel img {
+  width:100%; display:block; object-fit:contain;
+  image-rendering:pixelated;
+  background:#fff;
+}
+.img-panel.binary img {
+  filter:contrast(1.2);
+}
+
+@media(max-width:640px){
+  .img-panels-grid { grid-template-columns: 1fr 1fr; }
+}
+
+@media(max-width:640px){
+  :root{ --cell:36px; }
+  main{ padding:1rem .9rem; }
+  .board-wrap{ flex-direction:column; }
+  .ctrl-panel{ min-width:unset; }
+  .numpad{ grid-template-columns:repeat(5,1fr); }
+  .nk{ aspect-ratio:auto; height:42px; }
+  .brand-pill,.steps{ display:none; }
+}
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════
+     HEADER
+═══════════════════════════════════════════════════════ -->
+<header>
+  <div class="brand">
+    <span class="brand-name">Sudoku <em>OCR</em></span>
+    <span class="brand-pill">MSc Project</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <div id="ocr-badge"><span class="pulse"></span><span id="badge-txt">CNN</span></div>
+    <nav class="steps">
+      <div class="step active" id="s1"><span class="dot"></span>Upload</div>
+      <div class="step"        id="s2"><span class="dot"></span>Verify</div>
+      <div class="step"        id="s3"><span class="dot"></span>Pipeline</div>
+      <div class="step"        id="s4"><span class="dot"></span>Solved</div>
+    </nav>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════
+     MAIN
+═══════════════════════════════════════════════════════ -->
+<main>
+
+  <!-- ── 1. UPLOAD ──────────────────────────────────────────── -->
+  <section id="panel-upload">
+    <div class="sec-head">
+      <div class="sec-num">1</div>
+      <div class="sec-label">Upload a Telegraph sudoku image</div>
+    </div>
+
+    <div class="drop-zone" id="drop-zone">
+      <input type="file" id="file-in" accept="image/jpeg,image/png,image/webp,image/bmp"/>
+      <div class="dz-icon">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      </div>
+      <div class="dz-title">Drop your sudoku photo here</div>
+      <div class="dz-sub">Works with skewed, angled, or tilted newspaper photos</div>
+      <div class="dz-formats">
+        <span class="fmt-pill">JPEG</span><span class="fmt-pill">PNG</span>
+        <span class="fmt-pill">WEBP</span><span class="fmt-pill">BMP</span>
+      </div>
+      <button class="dz-cta">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Choose Image
+      </button>
+    </div>
+
+    <div id="status" class="idle">
+      <div class="st-icon">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      </div>
+      <span id="status-txt">Waiting for image…</span>
+    </div>
+  </section>
+
+  <!-- ── 2. BOARD ───────────────────────────────────────────── -->
+  <section id="panel-board">
+    <div class="sec-head">
+      <div class="sec-num">2</div>
+      <div class="sec-label">Verify &amp; correct digits</div>
+    </div>
+
+    <div id="digit-info" class="on">OCR detected <strong id="dcount">0</strong> digits</div>
+
+    <div class="board-wrap">
+
+      <!-- Grid -->
+      <div class="grid-shell"><div id="grid"></div></div>
+
+      <!-- Controls -->
+      <div class="ctrl-panel">
+
+        <!-- conflict chip -->
+        <div id="conflict-chip">
+          <svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span id="chip-txt">0 conflicts</span>
+        </div>
+
+        <!-- Numpad -->
+        <div>
+          <div class="ctrl-label">Number Pad</div>
+          <div class="numpad" id="numpad"></div>
+        </div>
+
+        <!-- Actions -->
+        <div>
+          <div class="ctrl-label">Actions</div>
+          <div class="action-col">
+            <button class="btn btn-primary" id="btn-solve">
+              <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Solve Puzzle
+            </button>
+            <button class="btn" id="btn-reset">
+              <svg viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.49"/></svg>
+              Reset to OCR Result
+            </button>
+            <button class="btn" id="btn-clear">
+              <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+              Clear Board
+            </button>
+            <button class="btn" id="btn-new" style="margin-top:3px">
+              <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload New Image
+            </button>
+          </div>
+        </div>
+
+        <!-- Tip -->
+        <div id="tip" class="on">
+          <strong>Tip:</strong> Click a cell then press a number key or tap the pad.
+          Blue = OCR-detected (editable). Board validates <em>live</em> — red = conflict.
+          Arrow keys move between cells.
+        </div>
+
+      </div><!-- /ctrl-panel -->
+    </div><!-- /board-wrap -->
+
+    <!-- Solved banner -->
+    <div id="banner">
+      <div class="banner-title">Puzzle Solved ✓</div>
+      <div class="banner-sub">All 81 cells filled and verified correct</div>
+    </div>
+
+    <!-- Board-level status -->
+    <div id="board-status"></div>
+
+  </section><!-- /panel-board -->
+
+  <!-- ── 3. IMAGE PIPELINE PANELS ──────────────────────────── -->
+  <section id="panel-images">
+    <div class="sec-head">
+      <div class="sec-num">3</div>
+      <div class="sec-label">OCR pipeline — image stages</div>
+    </div>
+    <div class="img-panels-grid" id="img-panels-grid">
+      <!-- populated by JS after OCR -->
+    </div>
+  </section>
+
+</main>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   APP
+═══════════════════════════════════════════════════════════════════ */
+const App = (() => {
+  const API = window.location.origin;
+
+  /* ── state ───────────────────────────────────────────────────── */
+  let board     = Array(81).fill(0);   // current board
+  let given     = Array(81).fill(false); // OCR-detected cells
+  let ocrSnap   = Array(81).fill(0);   // snapshot of raw OCR result
+  let selected  = -1;
+  let conflicts = [];                  // live conflict pairs
+  let valTimer  = null;
+
+  /* ── element refs ────────────────────────────────────────────── */
+  const $upload  = document.getElementById('panel-upload');
+  const $board   = document.getElementById('panel-board');
+  const $imgPnl  = document.getElementById('panel-images');
+  const $imgGrid = document.getElementById('img-panels-grid');
+  const $banner  = document.getElementById('banner');
+  const $tip     = document.getElementById('tip');
+  const $chip    = document.getElementById('conflict-chip');
+  const $chipTxt = document.getElementById('chip-txt');
+  const $dcount  = document.getElementById('dcount');
+  const $dinfo   = document.getElementById('digit-info');
+  const $bstatus = document.getElementById('board-status');
+  const fileIn   = document.getElementById('file-in');
+  const dropZone = document.getElementById('drop-zone');
+
+  /* ── status helpers ──────────────────────────────────────────── */
+  const ICONS = {
+    idle:    `<svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`,
+    loading: `<div class="spinner"></div>`,
+    success: `<svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2.5"><polyline points="20 6 9 17 4 12"/></svg>`,
+    error:   `<svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+  };
+  const BAR_STYLE = {
+    idle:    'background:var(--bg-card);border-color:var(--border);color:var(--text-3)',
+    loading: 'background:var(--amber-dim);border-color:var(--amber);color:var(--amber)',
+    success: 'background:var(--green-dim);border-color:var(--green-glow);color:var(--green)',
+    error:   'background:var(--red-dim);border-color:var(--red-glow);color:var(--red)',
+  };
+
+  function setStatus(state, msg, inBoard=false) {
+    if (inBoard) {
+      $bstatus.style.cssText = BAR_STYLE[state] || BAR_STYLE.idle;
+      $bstatus.innerHTML = msg
+        ? `<div class="st-icon">${ICONS[state]||''}</div><span>${msg}</span>`
+        : '';
+    } else {
+      const bar = document.getElementById('status');
+      bar.className = state;
+      bar.querySelector('.st-icon').innerHTML = ICONS[state] || '';
+      document.getElementById('status-txt').textContent = msg;
+    }
+  }
+
+  function setPills(step) {
+    ['s1','s2','s3','s4'].forEach((id,i) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.className = 'step' + (i+1<step?' done':i+1===step?' active':'');
+    });
+  }
+
+  function setOcrBadge(mode) {
+    const badge = document.getElementById('ocr-badge');
+    badge.className = mode;
+    badge.style.display = 'flex';
+    document.getElementById('badge-txt').textContent =
+      mode === 'cnn' ? 'CNN Active' : 'kNN Fallback';
+  }
+
+  /* ── build grid & numpad ─────────────────────────────────────── */
+  function buildGrid() {
+    const el = document.getElementById('grid');
+    el.innerHTML = '';
+    for (let i=0;i<81;i++) {
+      const r=Math.floor(i/9), c=i%9;
+      const d = document.createElement('div');
+      d.className='cell'; d.id='c'+i;
+      d.dataset.r=r; d.dataset.c=c;
+      d.addEventListener('click', ()=>selectCell(i));
+      el.appendChild(d);
+    }
+  }
+
+  function buildNumpad() {
+    const el = document.getElementById('numpad');
+    el.innerHTML='';
+    for (let n=1;n<=9;n++) {
+      const b=document.createElement('button');
+      b.className='nk'; b.textContent=n;
+      b.addEventListener('click',()=>enterDigit(n));
+      el.appendChild(b);
+    }
+    const del=document.createElement('button');
+    del.className='nk del'; del.textContent='DEL';
+    del.addEventListener('click',()=>enterDigit(0));
+    el.appendChild(del);
+  }
+
+  /* ── render ──────────────────────────────────────────────────── */
+  function render() {
+    const sr = selected>=0 ? Math.floor(selected/9) : -1;
+    const sc = selected>=0 ? selected%9 : -1;
+    const cSet = new Set(conflicts.flat());
+
+    for (let i=0;i<81;i++) {
+      const el = document.getElementById('c'+i);
+      if (!el) continue;
+      const r=Math.floor(i/9), c=i%9;
+
+      // reset classes
+      el.className='cell';
+      el.dataset.r=r; el.dataset.c=c;
+      el.textContent = board[i] || '';
+
+      if (given[i])       el.classList.add('given');
+      if (cSet.has(i))    el.classList.add('conflict');
+      if (i===selected)   el.classList.add('selected');
+      else if (sr>=0) {
+        const sameBox = Math.floor(r/3)===Math.floor(sr/3) &&
+                        Math.floor(c/3)===Math.floor(sc/3);
+        if (r===sr||c===sc||sameBox) el.classList.add('peer');
+      }
+    }
+  }
+
+  function selectCell(i) {
+    selected = selected===i ? -1 : i;
+    render();
+  }
+
+  function enterDigit(n) {
+    if (selected<0) return;
+    if (given[selected] && n!==0) return;   // protect OCR cells
+    board[selected]=n;
+    $banner.classList.remove('on');
+    render();
+    const el=document.getElementById('c'+selected);
+    if (el && !given[selected] && n!==0) el.classList.add('user');
+    scheduleValidate();
+  }
+
+  /* keyboard */
+  document.addEventListener('keydown', e => {
+    if (!$board.classList.contains('on')) return;
+    const n=parseInt(e.key);
+    if (!isNaN(n)&&n>=0&&n<=9&&selected>=0){enterDigit(n);return;}
+    if ((e.key==='Backspace'||e.key==='Delete')&&selected>=0){enterDigit(0);return;}
+    const mv={ArrowRight:1,ArrowLeft:-1,ArrowDown:9,ArrowUp:-9};
+    if (mv[e.key]!==undefined){
+      e.preventDefault();
+      selectCell(Math.max(0,Math.min(80,(selected<0?0:selected)+mv[e.key])));
+    }
+  });
+
+  /* ── live validation ─────────────────────────────────────────── */
+  function scheduleValidate() {
+    clearTimeout(valTimer);
+    valTimer = setTimeout(runValidate, 100);
+  }
+
+  async function runValidate() {
+    try {
+      const res  = await fetch(`${API}/api/validate`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({board})
+      });
+      const data = await res.json();
+      conflicts  = data.conflicts || [];
+    } catch {
+      conflicts = localConflicts();
+    }
+    render();
+    updateChip();
+  }
+
+  function localConflicts() {
+    const pairs=[]; const seen=new Set();
+    for (let i=0;i<81;i++){
+      if(!board[i]) continue;
+      const r=Math.floor(i/9),c=i%9;
+      const br=Math.floor(r/3)*3,bc=Math.floor(c/3)*3;
+      const peers=[
+        ...Array.from({length:9},(_,j)=>r*9+j).filter(j=>j!==i),
+        ...Array.from({length:9},(_,j)=>j*9+c).filter(j=>j!==i),
+        ...[0,1,2].flatMap(dr=>[0,1,2].map(dc=>(br+dr)*9+(bc+dc))).filter(j=>j!==i),
+      ];
+      for(const ni of peers){
+        if(board[ni]===board[i]){
+          const k=`${Math.min(i,ni)}-${Math.max(i,ni)}`;
+          if(!seen.has(k)){seen.add(k);pairs.push([i,ni]);}
+        }
+      }
+    }
+    return pairs;
+  }
+
+  function updateChip() {
+    const n = conflicts.length;
+    if (n>0){
+      $chipTxt.textContent=`${n} conflict${n>1?'s':''} — check red cells`;
+      $chip.classList.add('on');
+    } else {
+      $chip.classList.remove('on');
+    }
+  }
+
+  /* ── image pipeline panels ───────────────────────────────────── */
+  const IMG_LABELS = {
+    original:    'Original + grid corners',
+    grayscale:   'Grayscale',
+    threshold:   'Adaptive threshold',
+    warped:      'Perspective-corrected',
+    binary_grid: 'Binary cell grid (OCR input)',
+  };
+  const IMG_ORDER = ['original','grayscale','threshold','warped','binary_grid'];
+
+  function showImagePanels(images) {
+    if (!images) return;
+    $imgGrid.innerHTML = '';
+    IMG_ORDER.forEach(key => {
+      const b64 = images[key];
+      if (!b64) return;
+      const panel = document.createElement('div');
+      panel.className = 'img-panel' + (key === 'binary_grid' ? ' binary' : '');
+      panel.innerHTML =
+        `<div class="img-panel-label">${IMG_LABELS[key] || key}</div>` +
+        `<img src="data:image/png;base64,${b64}" alt="${key}" loading="lazy"/>`;
+      $imgGrid.appendChild(panel);
+    });
+    $imgPnl.classList.add('on');
+  }
+
+  /* ── load board ──────────────────────────────────────────────── */
+  function loadBoard(digits, mode) {
+    board    = [...digits];
+    ocrSnap  = [...digits];
+    given    = digits.map(v=>v!==0);
+    selected = -1; conflicts=[];
+    $banner.classList.remove('on');
+    $chip.classList.remove('on');
+    $dcount.textContent = digits.filter(Boolean).length;
+    $dinfo.classList.add('on');
+    setOcrBadge(mode==='cnn'?'cnn':'knn');
+    render();
+    runValidate();
+  }
+
+  /* ── OCR ─────────────────────────────────────────────────────── */
+  async function handleFile(file) {
+    if (!file||!file.type.startsWith('image/'))
+      {setStatus('error','Please upload a valid image file.');return;}
+
+    setStatus('loading','Running OCR — detecting grid and classifying digits…');
+    const fd=new FormData(); fd.append('image',file);
+
+    try {
+      const res  = await fetch(`${API}/api/ocr`,{method:'POST',body:fd});
+      const data = await res.json();
+      if (!res.ok||data.error){setStatus('error',data.error||'OCR failed. Try a clearer image.');return;}
+
+      loadBoard(data.board, data.mode);
+      showImagePanels(data.images);
+      setPills(3);
+      $upload.style.display='none';
+      $board.classList.add('on');
+      setStatus('success',
+        `OCR complete — ${data.digit_count} digits detected (${data.mode==='cnn'?'CNN model':'kNN fallback'}).`);
+
+    } catch {
+      // demo fallback when backend is offline
+      const demo=[
+        5,3,0,0,7,0,0,0,0, 6,0,0,1,9,5,0,0,0, 0,9,8,0,0,0,0,6,0,
+        8,0,0,0,6,0,0,0,3, 4,0,0,8,0,3,0,0,1, 7,0,0,0,2,0,0,0,6,
+        0,6,0,0,0,0,2,8,0, 0,0,0,4,1,9,0,0,5, 0,0,0,0,8,0,0,7,9,
+      ];
+      loadBoard(demo,'knn');
+      setPills(3);
+      $upload.style.display='none';
+      $board.classList.add('on');
+      setStatus('error','⚠ Backend offline — demo puzzle loaded. Run: python app.py');
+    }
+  }
+
+  /* ── solve ───────────────────────────────────────────────────── */
+  async function solve() {
+    setStatus('loading','Solving…',true);
+    $banner.classList.remove('on');
+    conflicts=[]; render();
+
+    try {
+      const res  = await fetch(`${API}/api/solve`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({board})
+      });
+      applySolve(await res.json());
+    } catch {
+      applySolve(clientSolve([...board]));
+    }
+  }
+
+  function applySolve(data) {
+    if (data.solved) {
+      board = data.board; conflicts=[]; render();
+      // animate filled cells
+      for(let i=0;i<81;i++){
+        if(!given[i]&&board[i]){
+          const el=document.getElementById('c'+i);
+          if(el){el.classList.add('solved');el.style.animationDelay=i*6+'ms';}
+        }
+      }
+      $banner.classList.add('on');
+      $chip.classList.remove('on');
+      $tip.classList.remove('on');
+      setStatus('success','Puzzle solved — all 81 cells filled correctly.',true);
+      setPills(4);
+    } else {
+      conflicts = data.conflicts||[];
+      render(); updateChip();
+      setStatus('error', data.error||'No solution — check red cells.',true);
+    }
+  }
+
+  /* ── client-side solver (offline fallback) ───────────────────── */
+  function clientSolve(b) {
+    function ok(b,i,v){
+      const r=Math.floor(i/9),c=i%9;
+      for(let j=0;j<9;j++){
+        if(b[r*9+j]===v&&j!==c) return false;
+        if(b[j*9+c]===v&&j!==r) return false;
+      }
+      const br=Math.floor(r/3)*3,bc=Math.floor(c/3)*3;
+      for(let dr=0;dr<3;dr++) for(let dc=0;dc<3;dc++){
+        const ni=(br+dr)*9+(bc+dc); if(ni!==i&&b[ni]===v) return false;
+      }
+      return true;
+    }
+    const cfls=localConflicts();
+    if(cfls.length) return{solved:false,board:b,conflicts:cfls,error:'Conflicting digits.'};
+    function bt(b){
+      const e=b.indexOf(0); if(e===-1) return true;
+      for(let n=1;n<=9;n++){if(ok(b,e,n)){b[e]=n;if(bt(b)) return true;b[e]=0;}}
+      return false;
+    }
+    const s=bt(b);
+    return{solved:s,board:b,conflicts:[],error:s?null:'No valid solution exists.'};
+  }
+
+  /* ── reset / clear / new ─────────────────────────────────────── */
+  function resetToOCR() {
+    board=[...ocrSnap]; selected=-1;
+    $banner.classList.remove('on');
+    document.querySelectorAll('.cell').forEach(c=>
+      c.classList.remove('conflict','solved','user'));
+    $tip.classList.add('on');
+    runValidate();
+    setStatus('success','Board reset to OCR result.',true);
+    render();
+  }
+
+  function clearAll() {
+    board=Array(81).fill(0); given=Array(81).fill(false);
+    ocrSnap=Array(81).fill(0); selected=-1; conflicts=[];
+    $banner.classList.remove('on'); $chip.classList.remove('on');
+    document.querySelectorAll('.cell').forEach(c=>
+      c.classList.remove('conflict','solved','user','given'));
+    setStatus('','',true); render();
+  }
+
+  function uploadNew() {
+    clearAll();
+    $board.classList.remove('on');
+    $imgPnl.classList.remove('on');
+    $imgGrid.innerHTML = '';
+    $upload.style.display='';
+    $dinfo.classList.remove('on');
+    setStatus('idle','Waiting for image…');
+    setPills(1);
+    fileIn.value='';
+    $tip.classList.add('on');
+  }
+
+  /* ── drag & drop ─────────────────────────────────────────────── */
+  dropZone.addEventListener('dragover', e=>{e.preventDefault();dropZone.classList.add('drag');});
+  dropZone.addEventListener('dragleave', ()=>dropZone.classList.remove('drag'));
+  dropZone.addEventListener('drop', e=>{
+    e.preventDefault(); dropZone.classList.remove('drag');
+    handleFile(e.dataTransfer.files[0]);
+  });
+  fileIn.addEventListener('change', e=>handleFile(e.target.files[0]));
+
+  /* ── button wiring ───────────────────────────────────────────── */
+  document.getElementById('btn-solve').addEventListener('click', solve);
+  document.getElementById('btn-reset').addEventListener('click', resetToOCR);
+  document.getElementById('btn-clear').addEventListener('click', clearAll);
+  document.getElementById('btn-new').addEventListener('click', uploadNew);
+
+  /* ── health check on load ────────────────────────────────────── */
+  (async()=>{
+    try{
+      const d=await(await fetch(`${API}/api/health`)).json();
+      setOcrBadge(d.model_ready?'cnn':'knn');
+      document.getElementById('ocr-badge').style.display='flex';
+    }catch{}
+  })();
+
+  /* ── init ────────────────────────────────────────────────────── */
+  buildGrid(); buildNumpad(); render();
+
+})();
+</script>
+</body>
+</html>
