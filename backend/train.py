@@ -1,46 +1,54 @@
 """
-backend/train.py  — DigitCNN Telegraph Edition v3
-==================================================
-HOW TO RUN:
+backend/train.py
+================
+Training script for DigitCNN — Telegraph Newspaper Sudoku Edition.
+
+HOW TO RUN
+──────────
     cd <project_root>
     python backend/train.py
 
-Saves:
-    backend/model_weights/digit_cnn.pth       ← best validation accuracy
-    backend/model_weights/digit_cnn_last.pth  ← last epoch
+Produces:
+    backend/model_weights/digit_cnn.pth        ← best validation checkpoint
+    backend/model_weights/digit_cnn_last.pth   ← last epoch checkpoint
 
-WHY THIS VERSION ACHIEVES NEAR-100% ON TELEGRAPH IMAGES
-────────────────────────────────────────────────────────
-Previous versions trained on MNIST + synthetic fonts but the model still
-failed on real Telegraph cells.  The fundamental issues were:
+DESIGN PHILOSOPHY
+─────────────────
+The single biggest reason previous models failed on Telegraph images is the
+DOMAIN GAP: the model was trained on clean MNIST digits but at inference it
+sees images that have been through the OCR pipeline (binarisation → crop →
+resize → normalise).  The fix applied here is called PIPELINE-AWARE TRAINING:
 
-  1. DOMAIN GAP — synthetic images never exactly match real newspaper photos.
-     Fix: We render digits using the exact same OpenCV binarisation pipeline
-     that ocr.py uses at inference.  The model trains on what it will see.
+    Render digit → Degrade → OCR binarise → CNN
 
-  2. MODEL TOO WEAK — DigitCNN had 3 conv blocks but no residual connections.
-     Fix: Enhanced DigitCNN with residual skip connections + deeper head.
-     Same interface (DigitCNN class) — drop-in replacement for model.py.
+By running the EXACT same OpenCV binarisation pipeline used in ocr.py during
+training, the model sees the same image format it will see at inference time.
+This alone accounts for the largest accuracy improvement.
 
-  3. TEST-TIME UNCERTAINTY — a single forward pass on a noisy cell is unreliable.
-     Fix: Test-Time Augmentation (TTA) runs 8 augmented versions per cell
-     and averages probabilities.  Dramatically improves borderline cells.
+DATASET COMPOSITION (total ~1.1 million training samples)
+───────────────────────────────────────────────────────────
+  TelegraphOCR × 10   Rendered + degraded + exact-OCR-pipeline binarisation
+                       PRIMARY dataset.  Model trains on what it will see.
+  TelegraphFont × 5   Rendered + degraded, no OCR binarise step
+                       Bridges raw appearance to binarised appearance.
+  MNIST inverted × 1  Standard MNIST, colour-inverted to black-on-white
+  MNIST hard     × 4  Blurred + thresholded — stress-tests 1↔7, 3↔8, 6↔9
+  MNIST persp    × 2  RandomPerspective + RandomAffine
+  MNIST noise    × 2  Gaussian noise + brightness jitter
 
-  4. WRONG AUGMENTATION MIX — too much MNIST variety, not enough Telegraph.
-     Fix: 70% of training data is TelegraphFont with the exact OCR pipeline
-     binarisation applied.  MNIST is kept for variety (30%).
+TRAINING DETAILS
+────────────────
+  Optimiser  : AdamW  (lr=1e-3, weight_decay=3e-4)
+  Schedule   : 5-epoch linear warm-up → cosine annealing to epoch 100
+  Loss       : CrossEntropyLoss with label_smoothing=0.10
+  AMP        : Mixed-precision on CUDA (fp16 forward, fp32 gradients)
+  Grad clip  : max_norm=2.0 — stabilises noisy batches
+  Batch size : 256 GPU / 128 CPU
 
-DATASET COMPOSITION  (~378 000 training samples):
-  TelegraphOCR   ×7   Rendered + exact-OCR-pipeline binarisation  (PRIMARY)
-  TelegraphFont  ×4   Rendered + realistic degradation
-  HardPair       ×3   MNIST with 1↔7, 3↔8, 6↔9 confusion stress-test
-  Perspective    ×2   MNIST with camera-angle simulation
-  Geometric      ×1   MNIST affine
-  Noise          ×1   MNIST newsprint grain
-
-NORMALISATION (must match ocr.py):
-  _CNN_MEAN = (0.8693,)   _CNN_STD = (0.3081,)
-  All samples: BLACK digit on WHITE background before normalisation.
+NORMALISATION (must match ocr.py identically)
+──────────────────────────────────────────────
+  mean = (0.8693,)   std = (0.3081,)
+  Convention: BLACK digit on WHITE background before normalisation.
 """
 
 import os, sys, random
@@ -52,7 +60,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, ConcatDataset, Dataset
 from torchvision import datasets, transforms
-from PIL import Image, ImageFilter, ImageEnhance, ImageDraw, ImageFont
+from PIL import Image, ImageFilter, ImageDraw, ImageFont
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _BACKEND = os.path.dirname(os.path.abspath(__file__))
@@ -61,584 +69,487 @@ _DATA    = os.path.join(_ROOT, "data")
 _WDIR    = os.path.join(_BACKEND, "model_weights")
 _BEST    = os.path.join(_WDIR, "digit_cnn.pth")
 _LAST    = os.path.join(_WDIR, "digit_cnn_last.pth")
-if _BACKEND not in sys.path: sys.path.insert(0, _BACKEND)
+if _BACKEND not in sys.path:
+    sys.path.insert(0, _BACKEND)
 
-# ── Hyperparameters ────────────────────────────────────────────────────────────
+# ── Training hyperparameters ───────────────────────────────────────────────────
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 256 if torch.cuda.is_available() else 128
-EPOCHS     = 80
+EPOCHS     = 100
 LR         = 1e-3
+WARMUP_EP  = 5          # linear warm-up epochs
+SPD        = 8000       # samples per digit per copy in TelegraphOCR
 
-# ── Normalisation — MUST match ocr.py _CNN_MEAN / _CNN_STD exactly ────────────
+# ── Normalisation — MUST be identical in ocr.py ───────────────────────────────
 _MEAN      = (0.8693,)
 _STD       = (0.3081,)
 _normalise = transforms.Normalize(_MEAN, _STD)
 _to_tensor = transforms.ToTensor()
 
-random.seed(42); np.random.seed(42); torch.manual_seed(42)
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ENHANCED MODEL — DigitCNN with Residual Connections
-#  Drop-in replacement: same class name, same output shape (B, 10).
-#  Residual connections prevent vanishing gradients and allow deeper training.
+#  MODEL DEFINITION
+#  Imported from model.py so train.py and ocr.py always use the identical class.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _ResBlock(nn.Module):
-    """Two conv layers with a residual skip connection + SE attention."""
-    def __init__(self, ch: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
-            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(ch),
-        )
-        # Squeeze-and-Excitation channel attention
-        mid = max(4, ch // 8)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
-            nn.Linear(ch, mid, bias=False), nn.ReLU(inplace=True),
-            nn.Linear(mid, ch, bias=False), nn.Sigmoid(),
-        )
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        out = self.conv(x)
-        se  = self.se(out).unsqueeze(-1).unsqueeze(-1)
-        return self.relu(x + out * se)
-
-
-class DigitCNN(nn.Module):
-    """
-    Enhanced DigitCNN for Telegraph newspaper sudoku digits.
-    Input : (B, 1, 28, 28) — black digit on white background
-    Output: (B, 10)         — logits for classes 0..9 (0 = blank, unused)
-
-    Architecture:
-      Stem  → 3 stages of (conv-down + residual block) → global avg pool
-           → wide classifier head with dropout
-    """
-    def __init__(self):
-        super().__init__()
-
-        # Stem: (1,28,28) → (32,28,28)
-        self.stem = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-        )
-
-        # Stage 1: (32,28,28) → (64,14,14)
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            _ResBlock(64),
-            nn.Dropout2d(0.15),
-        )
-
-        # Stage 2: (64,14,14) → (128,7,7)
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            _ResBlock(128),
-            _ResBlock(128),
-            nn.Dropout2d(0.20),
-        )
-
-        # Stage 3: (128,7,7) → (256,4,4)
-        self.stage3 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-            _ResBlock(256),
-            nn.Dropout2d(0.25),
-        )
-
-        # Global avg pool → (256,1,1) → 256
-        self.gap = nn.AdaptiveAvgPool2d(1)
-
-        # Wide classifier head
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256, 512), nn.ReLU(inplace=True), nn.Dropout(0.45),
-            nn.Linear(512, 256), nn.ReLU(inplace=True), nn.Dropout(0.30),
-            nn.Linear(256,  10),
-        )
-
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.gap(x)
-        return self.head(x)
-
-    def predict_single(self, x):
-        self.eval()
-        with torch.no_grad():
-            probs = F.softmax(self.forward(x), dim=1)
-            conf, pred = probs.max(dim=1)
-        return pred.item(), conf.item()
+from model import DigitCNN          # noqa: E402  (after sys.path insert)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FONT DISCOVERY  (same logic as v2 — works on Windows + Linux)
+#  FONT DISCOVERY  (Windows + Linux + macOS)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_WIN_FONTS_SYSTEM = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-_WIN_FONTS_USER   = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""), r"Microsoft\Windows\Fonts")
-
-# Linux/macOS font paths
-_LINUX_FONT_DIRS = [
+_WIN_SYS  = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+_WIN_USR  = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                          r"Microsoft\Windows\Fonts")
+_LIN_DIRS = [
     "/usr/share/fonts", "/usr/local/share/fonts",
-    os.path.expanduser("~/.fonts"), os.path.expanduser("~/.local/share/fonts"),
+    os.path.expanduser("~/.fonts"),
+    os.path.expanduser("~/.local/share/fonts"),
 ]
 
-def _font(*names):
-    """Return first existing path for the given font filename(s)."""
-    search_dirs = [_WIN_FONTS_SYSTEM, _WIN_FONTS_USER] + _LINUX_FONT_DIRS
+
+def _find_font(*names: str):
+    """Return the path of the first font filename found, or None."""
     for name in names:
-        for folder in search_dirs:
-            path = os.path.join(folder, name)
-            if os.path.isfile(path): return path
-        # Recursive search in Linux font dirs
-        for base in _LINUX_FONT_DIRS:
+        for folder in [_WIN_SYS, _WIN_USR] + _LIN_DIRS:
+            p = os.path.join(folder, name)
+            if os.path.isfile(p):
+                return p
+        for base in _LIN_DIRS:
             for root, _, files in os.walk(base):
-                if name in files: return os.path.join(root, name)
+                if name in files:
+                    return os.path.join(root, name)
     return None
 
+
 _FONTS = [p for p in [
-    _font("LiberationSans-Regular.ttf"),
-    _font("FreeSans.ttf"),
-    _font("DejaVuSans.ttf"),
-    _font("DejaVuSans-ExtraLight.ttf"),
-    _font("arial.ttf", "Arial.ttf"),
-    _font("calibri.ttf", "Calibri.ttf"),
-    _font("trebuc.ttf", "Trebuc.ttf"),
-    _font("NotoSans-Regular.ttf"),
-    _font("Ubuntu-R.ttf"),
+    _find_font("LiberationSans-Regular.ttf"),
+    _find_font("LiberationSans-Bold.ttf"),
+    _find_font("FreeSans.ttf"),
+    _find_font("DejaVuSans.ttf"),
+    _find_font("DejaVuSans-Bold.ttf"),
+    _find_font("arial.ttf", "Arial.ttf"),
+    _find_font("calibri.ttf", "Calibri.ttf"),
+    _find_font("times.ttf", "Times New Roman.ttf", "timesnewroman.ttf"),
+    _find_font("georgia.ttf", "Georgia.ttf"),
+    _find_font("trebuc.ttf"),
+    _find_font("NotoSans-Regular.ttf"),
+    _find_font("Ubuntu-R.ttf"),
 ] if p is not None]
 
 if not _FONTS:
-    print("WARNING: No TTF fonts found. Using PIL default (lower accuracy).")
-    print("Install Liberation Sans or DejaVu Sans for best results.")
+    print("  WARNING: No TTF fonts found — using PIL default bitmap font.")
+    print("  Install Liberation Sans for best accuracy.")
+    print("  Ubuntu/Debian: sudo apt install fonts-liberation")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  OCR-PIPELINE BINARISATION  (EXACT copy of ocr.py's pipeline)
-#  Training with this ensures the model sees EXACTLY what it sees at inference.
+#  OCR PIPELINE BINARISATION
+#  This is an EXACT copy of the binarisation logic from ocr.py.
+#  Keeping them in sync is critical: the model must train on the same image
+#  format it will see at inference time.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _ocr_binarise(pil_img: Image.Image) -> Image.Image:
+def _pipeline_binarise(pil_img: Image.Image) -> Image.Image:
     """
-    Apply the exact same binarisation that ocr.py uses at inference.
-    This is the KEY innovation — train on what the model will actually see.
+    Apply the same adaptive-threshold binarisation that ocr.py uses.
+    Returns a 28×28 PIL image: BLACK digit on WHITE background.
+
+    Steps mirror ocr.py's _best_binarise() + _prep_for_cnn():
+      1. Try 4 thresholding methods; pick best by largest valid contour.
+      2. Polarity check: border ring must be background.
+      3. Remove noise (morphological open).
+      4. Crop tight to digit bounding box + 20% padding.
+      5. Scale to 20×20, centre on 28×28 canvas.
+      6. Invert to black-digit-on-white.
     """
-    cell = np.array(pil_img.convert("L"), dtype=np.uint8)
+    cell    = np.array(pil_img.convert("L"), dtype=np.uint8)
+    h, w    = cell.shape
     blurred = cv2.GaussianBlur(cell, (3, 3), 0)
 
     best_b, best_s = None, -1.0
+
     for method in ('a2', 'a4', 'a6', 'otsu'):
         if method == 'a2':
-            b = cv2.adaptiveThreshold(blurred, 255,
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 2)
+            b = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 15, 2)
         elif method == 'a4':
-            b = cv2.adaptiveThreshold(blurred, 255,
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4)
+            b = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 15, 4)
         elif method == 'a6':
-            b = cv2.adaptiveThreshold(blurred, 255,
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 6)
+            b = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 11, 6)
         else:
             _, b = cv2.threshold(blurred, 0, 255,
                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        # Polarity check
-        h, w = b.shape
-        bw   = max(2, min(5, h // 6))
-        border_mask = np.zeros_like(b, dtype=bool)
-        border_mask[:bw,:] = border_mask[-bw:,:] = True
-        border_mask[:,:bw] = border_mask[:,-bw:] = True
-        if np.mean(b[border_mask]) > 100:
+        # Polarity check — border ring should be background (black)
+        bw = max(2, min(5, h // 6))
+        mask = np.zeros_like(b, dtype=bool)
+        mask[:bw, :] = mask[-bw:, :] = mask[:, :bw] = mask[:, -bw:] = True
+        if np.mean(b[mask]) > 100:
             b = cv2.bitwise_not(b)
 
+        # Remove isolated noise pixels
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
         b = cv2.morphologyEx(b, cv2.MORPH_OPEN, k, iterations=1)
 
+        # Guard: >55% foreground is not a digit
         if np.count_nonzero(b) / b.size > 0.55:
             b = np.zeros_like(b)
 
-        # Score: largest valid contour area fraction
+        # Score by largest valid contour
         k2 = np.ones((2, 2), np.uint8)
-        cleaned = cv2.erode(b, k2, iterations=1)
-        cnts, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL,
+        cl = cv2.erode(b, k2, iterations=1)
+        cnts, _ = cv2.findContours(cl, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
-        valid = [c for c in cnts if cv2.contourArea(c) >= (h*w) * 0.015]
-        s = min(cv2.contourArea(max(valid, key=cv2.contourArea)) / (h*w), 0.5) \
-            if valid else 0.0
+        valid = [c for c in cnts if cv2.contourArea(c) >= h * w * 0.015]
+        s = (min(cv2.contourArea(max(valid, key=cv2.contourArea)) / (h*w), 0.5)
+             if valid else 0.0)
         if s > best_s:
             best_s, best_b = s, b
 
     if best_b is None:
         _, best_b = cv2.threshold(cell, 127, 255, cv2.THRESH_BINARY_INV)
 
-    # Invert to black-digit-on-white (MNIST convention for CNN)
+    # Invert to black-digit-on-white
     result = cv2.bitwise_not(best_b)
 
-    # Crop tight to digit + centre on 28×28 (same as _prep_for_cnn in ocr.py)
-    k3 = np.ones((2,2), np.uint8)
-    white_on_black = best_b   # white digit on black
-    cleaned2 = cv2.erode(white_on_black, k3, iterations=1)
-    cnts2, _ = cv2.findContours(cleaned2, cv2.RETR_EXTERNAL,
-                                 cv2.CHAIN_APPROX_SIMPLE)
+    # Crop tight to digit bounding box
+    k3 = np.ones((2, 2), np.uint8)
+    cl2 = cv2.erode(best_b, k3, iterations=1)
+    cnts2, _ = cv2.findContours(cl2, cv2.RETR_EXTERNAL,
+                                  cv2.CHAIN_APPROX_SIMPLE)
     valid2 = [c for c in cnts2
-              if cv2.contourArea(c) >= (cell.shape[0]*cell.shape[1]) * 0.015]
+              if cv2.contourArea(c) >= h * w * 0.015]
 
     if valid2:
-        best_cnt = max(valid2, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(best_cnt)
-        px = max(2, int(w * 0.20)); py = max(2, int(h * 0.20))
-        x1 = max(0, x-px); y1 = max(0, y-py)
-        x2 = min(result.shape[1], x+w+px)
-        y2 = min(result.shape[0], y+h+py)
+        x, y, bw_, bh_ = cv2.boundingRect(max(valid2, key=cv2.contourArea))
+        px = max(2, int(bw_ * 0.20)); py = max(2, int(bh_ * 0.20))
+        x1 = max(0, x - px);  y1 = max(0, y - py)
+        x2 = min(w, x + bw_ + px); y2 = min(h, y + bh_ + py)
         crop = result[y1:y2, x1:x2]
         if crop.size > 0:
-            dh, dw  = crop.shape
-            scale   = 20.0 / max(dh, dw)
-            nw_     = max(1, int(dw * scale))
-            nh_     = max(1, int(dh * scale))
-            resized = cv2.resize(crop, (nw_, nh_), interpolation=cv2.INTER_AREA)
-            canvas  = np.full((28, 28), 255, dtype=np.uint8)
-            top     = (28 - nh_) // 2; left = (28 - nw_) // 2
-            canvas[top:top+nh_, left:left+nw_] = resized
+            dh, dw   = crop.shape
+            scale    = 20.0 / max(dh, dw)
+            nw_, nh_ = max(1, int(dw * scale)), max(1, int(dh * scale))
+            resized  = cv2.resize(crop, (nw_, nh_), interpolation=cv2.INTER_AREA)
+            canvas   = np.full((28, 28), 255, dtype=np.uint8)
+            top      = (28 - nh_) // 2; left = (28 - nw_) // 2
+            canvas[top:top + nh_, left:left + nw_] = resized
             return Image.fromarray(canvas)
 
     return Image.fromarray(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DATASET 1 — TelegraphOCR  (PRIMARY — trains on exact inference pipeline)
+#  DATASET 1 — TelegraphOCR (PRIMARY)
+#  Renders digits → degrades → applies exact OCR binarisation pipeline.
+#  The model trains on exactly what it will see at inference.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TelegraphOCRDataset(Dataset):
     """
-    Renders Telegraph-style digits, applies realistic degradation,
-    then passes through the EXACT same binarisation as ocr.py uses.
-    The model trains on what it will actually see at inference time.
+    PRIMARY training dataset.
+
+    Pipeline per sample:
+      1. Render digit at 64×64 with random font + size
+      2. Downscale to 28×28 (anti-aliased)
+      3. Apply realistic photographic degradation
+      4. Run through _pipeline_binarise() — same as ocr.py at inference
+      5. Normalise
+
+    This is the key innovation: the model trains on binarised images, so
+    there is zero domain gap between training and inference.
     """
-    def __init__(self, samples_per_digit: int = 6000):
+
+    def __init__(self, samples_per_digit: int = SPD):
         self.spd   = samples_per_digit
         self.total = 9 * samples_per_digit
-        self.fonts = _FONTS
 
-    def __len__(self): return self.total
+    def __len__(self):
+        return self.total
 
-    def __getitem__(self, idx):
-        digit = idx // self.spd + 1   # 1..9
-        text  = str(digit)
+    def __getitem__(self, idx: int):
+        digit = idx // self.spd + 1    # label: 1..9
 
-        # ── Render digit ────────────────────────────────────────────────────
-        sz   = 64   # render large then downscale for anti-aliasing
+        img = self._render(str(digit))
+        img = self._degrade(img)
+        img = _pipeline_binarise(img)  # exact OCR pipeline
+        return _normalise(_to_tensor(img)), digit
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _render(self, text: str) -> Image.Image:
+        sz   = 64
         img  = Image.new("L", (sz, sz), 255)
         draw = ImageDraw.Draw(img)
 
-        if self.fonts:
-            font_path = random.choice(self.fonts)
-            font_size = random.randint(32, 52)
+        if _FONTS:
             try:
-                font = ImageFont.truetype(font_path, font_size)
+                font = ImageFont.truetype(
+                    random.choice(_FONTS),
+                    random.randint(32, 54))
             except Exception:
                 font = ImageFont.load_default()
         else:
             font = ImageFont.load_default()
 
-        bbox  = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-        x = (sz - tw) // 2 - bbox[0] + random.randint(-3, 3)
-        y = (sz - th) // 2 - bbox[1] + random.randint(-3, 3)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (sz - tw) // 2 - bbox[0] + random.randint(-4, 4)
+        y = (sz - th) // 2 - bbox[1] + random.randint(-4, 4)
         draw.text((x, y), text, font=font, fill=0)
 
-        # Downscale to 28x28 with anti-aliasing
-        img = img.resize((28, 28), Image.LANCZOS)
-
-        # ── Degradation pipeline ────────────────────────────────────────────
-        img = self._degrade(img)
-
-        # ── Apply exact OCR pipeline binarisation ───────────────────────────
-        img = _ocr_binarise(img)
-
-        return _normalise(_to_tensor(img)), digit
+        return img.resize((28, 28), Image.LANCZOS)
 
     def _degrade(self, img: Image.Image) -> Image.Image:
-        # Rotation
-        if random.random() > 0.3:
-            img = img.rotate(random.uniform(-10, 10),
-                             fillcolor=255, resample=Image.BILINEAR)
-        # Scale + position jitter
-        if random.random() > 0.2:
-            scale  = random.uniform(0.68, 0.96)
-            new_sz = max(10, int(28 * scale))
-            img    = img.resize((new_sz, new_sz), Image.LANCZOS)
-            canvas = Image.new("L", (28, 28), 255)
-            ox = (28 - new_sz)//2 + random.randint(-2, 2)
-            oy = (28 - new_sz)//2 + random.randint(-2, 2)
-            canvas.paste(img, (max(0, ox), max(0, oy)))
-            img = canvas
+        # Rotation ±12°
+        if random.random() > 0.25:
+            img = img.rotate(random.uniform(-12, 12),
+                              fillcolor=255, resample=Image.BILINEAR)
+
+        # Scale jitter: 65-97% of cell size
+        if random.random() > 0.20:
+            scale = random.uniform(0.65, 0.97)
+            ns    = max(10, int(28 * scale))
+            img   = img.resize((ns, ns), Image.LANCZOS)
+            c     = Image.new("L", (28, 28), 255)
+            ox    = (28 - ns) // 2 + random.randint(-3, 3)
+            oy    = (28 - ns) // 2 + random.randint(-3, 3)
+            c.paste(img, (max(0, ox), max(0, oy)))
+            img   = c
 
         arr = np.array(img, dtype=np.float32)
 
-        # Paper texture / newsprint grain
-        arr += np.random.normal(0, random.uniform(2, 14), arr.shape)
-        arr  = np.clip(arr, 0, 255)
+        # Newsprint grain — Gaussian noise simulates paper texture
+        sigma = random.uniform(2, 18)
+        arr  += np.random.normal(0, sigma, arr.shape)
+        arr   = np.clip(arr, 0, 255)
 
-        # Uneven lighting (hand shadow gradient)
-        if random.random() > 0.4:
+        # Uneven illumination — models hand shadow or curved newspaper page
+        if random.random() > 0.35:
             h, w = arr.shape
-            gx   = np.linspace(random.uniform(0.82, 1.0),
-                                random.uniform(0.82, 1.0), w)
-            gy   = np.linspace(random.uniform(0.82, 1.0),
-                                random.uniform(0.82, 1.0), h)
+            gx   = np.linspace(random.uniform(0.78, 1.0),
+                                random.uniform(0.78, 1.0), w)
+            gy   = np.linspace(random.uniform(0.78, 1.0),
+                                random.uniform(0.78, 1.0), h)
             arr  = np.clip(arr * np.outer(gy, gx), 0, 255)
 
-        # Ink density variation (light print vs heavy print)
-        if random.random() > 0.35:
-            ink = random.uniform(0.55, 1.45)
-            arr = 255 - np.clip((255 - arr) * ink, 0, 255)
+        # Ink density: light print (faint) to heavy print (bold)
+        if random.random() > 0.30:
+            ink  = random.uniform(0.50, 1.55)
+            arr  = 255 - np.clip((255 - arr) * ink, 0, 255)
 
         img = Image.fromarray(arr.astype(np.uint8))
 
-        # JPEG-like blur
-        if random.random() > 0.3:
+        # Camera blur / focus variation
+        if random.random() > 0.30:
             img = img.filter(ImageFilter.GaussianBlur(
-                radius=random.uniform(0.2, 1.2)))
+                radius=random.uniform(0.2, 1.4)))
 
-        # Perspective shear
-        if random.random() > 0.4:
-            shx = random.uniform(-0.15, 0.15)
-            shy = random.uniform(-0.10, 0.10)
-            img = img.transform((28, 28), Image.AFFINE,
-                                (1, shx, -shx*14, shy, 1, -shy*14),
-                                resample=Image.BILINEAR, fillcolor=255)
+        # Perspective shear — camera angle
+        if random.random() > 0.35:
+            shx = random.uniform(-0.18, 0.18)
+            shy = random.uniform(-0.12, 0.12)
+            img = img.transform(
+                (28, 28), Image.AFFINE,
+                (1, shx, -shx * 14, shy, 1, -shy * 14),
+                resample=Image.BILINEAR, fillcolor=255)
 
-        # Polarity guard
+        # Polarity sanity check — background should be bright
         arr2 = np.array(img, dtype=np.float32)
-        border_mean = (arr2[:3,:].mean() + arr2[-3:,:].mean() +
-                       arr2[:,:3].mean() + arr2[:,-3:].mean()) / 4
-        if border_mean < 100:
+        bm   = (arr2[:3, :].mean() + arr2[-3:, :].mean() +
+                arr2[:, :3].mean() + arr2[:, -3:].mean()) / 4
+        if bm < 100:
             arr2 = 255 - arr2
+
         return Image.fromarray(arr2.astype(np.uint8))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DATASET 2 — TelegraphFont  (renders + degrades, no OCR binarisation step)
+#  DATASET 2 — TelegraphFont (SECONDARY)
+#  Same render + degrade pipeline but WITHOUT the OCR binarise step.
+#  Provides intermediate-domain samples between raw renders and binarised cells.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TelegraphFontDataset(Dataset):
-    """Synthetic Telegraph-style digits with realistic degradation (no OCR binarise)."""
-    def __init__(self, samples_per_digit: int = 6000):
+
+    def __init__(self, samples_per_digit: int = SPD):
         self.spd   = samples_per_digit
         self.total = 9 * samples_per_digit
-        self.fonts = _FONTS
+        # Reuse TelegraphOCRDataset's render + degrade methods
+        self._ocr = TelegraphOCRDataset(samples_per_digit)
 
-    def __len__(self): return self.total
+    def __len__(self):
+        return self.total
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         digit = idx // self.spd + 1
-        text  = str(digit)
-
-        sz   = 64
-        img  = Image.new("L", (sz, sz), 255)
-        draw = ImageDraw.Draw(img)
-
-        if self.fonts:
-            font_path = random.choice(self.fonts)
-            font_size = random.randint(30, 50)
-            try:   font = ImageFont.truetype(font_path, font_size)
-            except: font = ImageFont.load_default()
-        else:
-            font = ImageFont.load_default()
-
-        bbox = draw.textbbox((0,0), text, font=font)
-        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-        x = (sz-tw)//2 - bbox[0] + random.randint(-3,3)
-        y = (sz-th)//2 - bbox[1] + random.randint(-3,3)
-        draw.text((x, y), text, font=font, fill=0)
-        img = img.resize((28, 28), Image.LANCZOS)
-        img = self._degrade(img)
+        img   = self._ocr._render(str(digit))
+        img   = self._ocr._degrade(img)
+        # No OCR binarise — raw degraded render
         return _normalise(_to_tensor(img)), digit
 
-    def _degrade(self, img):
-        if random.random() > 0.3:
-            img = img.rotate(random.uniform(-8,8), fillcolor=255,
-                             resample=Image.BILINEAR)
-        if random.random() > 0.2:
-            sc = random.uniform(0.72, 0.95); ns = max(12, int(28*sc))
-            img = img.resize((ns,ns), Image.LANCZOS)
-            c = Image.new("L",(28,28),255)
-            c.paste(img,((28-ns)//2,(28-ns)//2)); img = c
-        arr = np.array(img, dtype=np.float32)
-        arr += np.random.normal(0, random.uniform(3,12), arr.shape)
-        arr  = np.clip(arr,0,255)
-        if random.random()>0.5:
-            h,w = arr.shape
-            gx  = np.linspace(random.uniform(0.85,1.0),random.uniform(0.85,1.0),w)
-            gy  = np.linspace(random.uniform(0.85,1.0),random.uniform(0.85,1.0),h)
-            arr = np.clip(arr*np.outer(gy,gx),0,255)
-        img = Image.fromarray(arr.astype(np.uint8))
-        if random.random()>0.4:
-            img = img.filter(ImageFilter.GaussianBlur(
-                radius=random.uniform(0.3,1.0)))
-            if random.random()>0.5: img = img.filter(ImageFilter.SHARPEN)
-        if random.random()>0.5:
-            shx = random.uniform(-0.12,0.12); shy = random.uniform(-0.08,0.08)
-            img = img.transform((28,28),Image.AFFINE,
-                                (1,shx,-shx*14,shy,1,-shy*14),
-                                resample=Image.BILINEAR,fillcolor=255)
-        if random.random()>0.4:
-            arr2 = np.array(img,dtype=np.float32)
-            arr2 = 255-np.clip((255-arr2)*random.uniform(0.7,1.3),0,255)
-            img  = Image.fromarray(arr2.astype(np.uint8))
-        arr3 = np.array(img,dtype=np.float32)
-        bm   = (arr3[:3,:].mean()+arr3[-3:,:].mean()+
-                arr3[:,:3].mean()+arr3[:,-3:].mean())/4
-        if bm<100: arr3=255-arr3
-        return Image.fromarray(arr3.astype(np.uint8))
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MNIST-BASED AUGMENTATION DATASETS
+#  DATASET 3 — MNIST-based augmentation sets
+#  MNIST labels include 0 (blank), which we skip at collation.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class InvertedMNISTDataset(Dataset):
-    def __init__(self, mnist_ds, extra_transform=None):
+class _InvertedMNIST(Dataset):
+    """MNIST colour-inverted to black-digit-on-white + optional transform."""
+
+    def __init__(self, mnist_ds, transform=None):
         self.ds  = mnist_ds
-        self.aug = extra_transform
-    def __len__(self): return len(self.ds)
+        self.tfm = transform
+
+    def __len__(self):
+        return len(self.ds)
+
     def __getitem__(self, idx):
         img_t, label = self.ds[idx]
-        img_t = 1.0 - img_t          # invert → black digit on white
-        if self.aug:
-            img_t = self.aug(transforms.ToPILImage()(img_t))
+        img_t = 1.0 - img_t           # invert: white bg → black digit
+
+        if self.tfm is not None:
+            pil   = transforms.ToPILImage()(img_t)
+            img_t = self.tfm(pil)
         else:
             img_t = _normalise(img_t)
+
         return img_t, label
 
 
-class HardPairTransform:
-    """Stress-tests 1↔7, 2↔7, 3↔8, 6↔9 confusion pairs."""
-    def __call__(self, img):
+class _HardPairTransform:
+    """
+    Stress-tests visually similar digit pairs: 1↔7, 3↔8, 6↔9.
+    Applies: scale jitter → heavy blur → hard threshold → sharpen → rotation → shear.
+    Forces the model to learn subtle distinguishing features.
+    """
+    def __call__(self, img: Image.Image) -> torch.Tensor:
         img = img.convert("L")
-        sc  = random.uniform(0.65, 0.95); ns = max(10, int(28*sc))
-        img = img.resize((ns,ns), Image.LANCZOS)
-        canvas = Image.new("L",(28,28),255)
-        canvas.paste(img,((28-ns)//2,(28-ns)//2)); img=canvas
+
+        # Scale jitter
+        sc  = random.uniform(0.62, 0.96)
+        ns  = max(10, int(28 * sc))
+        img = img.resize((ns, ns), Image.LANCZOS)
+        c   = Image.new("L", (28, 28), 255)
+        c.paste(img, ((28 - ns) // 2, (28 - ns) // 2))
+        img = c
+
+        # Heavy blur then hard threshold — simulates over-compressed newsprint
         img = img.filter(ImageFilter.GaussianBlur(
-            radius=random.uniform(0.6,2.0)))
-        thr = random.randint(60,190)
-        img = img.point(lambda p: 0 if p<thr else 255)
-        if random.random()>0.3: img=img.filter(ImageFilter.SHARPEN)
-        if random.random()>0.4:
-            img=img.rotate(random.uniform(-10,10),fillcolor=255)
-        if random.random()>0.5:
-            shx=random.uniform(-0.18,0.18)
-            img=img.transform((28,28),Image.AFFINE,(1,shx,0,0,1,0),
-                              resample=Image.BILINEAR,fillcolor=255)
+            radius=random.uniform(0.8, 2.5)))
+        thr = random.randint(50, 200)
+        img = img.point(lambda p: 0 if p < thr else 255)
+
+        if random.random() > 0.3:
+            img = img.filter(ImageFilter.SHARPEN)
+        if random.random() > 0.4:
+            img = img.rotate(random.uniform(-12, 12), fillcolor=255)
+        if random.random() > 0.45:
+            shx = random.uniform(-0.20, 0.20)
+            img = img.transform(
+                (28, 28), Image.AFFINE, (1, shx, 0, 0, 1, 0),
+                resample=Image.BILINEAR, fillcolor=255)
+
         return _normalise(_to_tensor(img))
 
 
-class PerspectiveTransform:
-    def __call__(self, img):
+class _PerspectiveTransform:
+    def __call__(self, img: Image.Image) -> torch.Tensor:
         img = img.convert("L")
-        if random.random()>0.3:
-            img=transforms.RandomPerspective(
-                distortion_scale=random.uniform(0.1,0.35),p=1.0,fill=255)(img)
-        img=transforms.RandomAffine(
-            degrees=8,translate=(0.1,0.1),scale=(0.80,1.15),fill=255)(img)
+        if random.random() > 0.3:
+            img = transforms.RandomPerspective(
+                distortion_scale=random.uniform(0.12, 0.40),
+                p=1.0, fill=255)(img)
+        img = transforms.RandomAffine(
+            degrees=10, translate=(0.12, 0.12),
+            scale=(0.78, 1.18), fill=255)(img)
         return _normalise(_to_tensor(img))
 
 
-class GeometricTransform:
-    def __call__(self, img):
-        img=img.convert("L")
-        img=transforms.RandomAffine(
-            degrees=8,translate=(0.1,0.1),scale=(0.82,1.12),fill=255)(img)
-        return _normalise(_to_tensor(img))
-
-
-class NoiseTransform:
-    def __call__(self, img):
-        img=img.convert("L")
-        arr=np.array(img,dtype=np.float32)
-        arr+=np.random.normal(0,random.uniform(5,15),arr.shape)
-        arr=np.clip(arr,0,255)
-        if random.random()>0.5:
-            arr=np.clip(arr*random.uniform(0.80,1.15)+random.uniform(-10,10),0,255)
-        img=Image.fromarray(arr.astype(np.uint8))
-        if random.random()>0.5:
-            img=img.filter(ImageFilter.GaussianBlur(
-                radius=random.uniform(0.2,0.7)))
+class _NoiseTransform:
+    def __call__(self, img: Image.Image) -> torch.Tensor:
+        img = img.convert("L")
+        arr = np.array(img, dtype=np.float32)
+        arr += np.random.normal(0, random.uniform(6, 20), arr.shape)
+        arr  = np.clip(arr, 0, 255)
+        if random.random() > 0.4:
+            arr = np.clip(
+                arr * random.uniform(0.75, 1.20) + random.uniform(-15, 15),
+                0, 255)
+        img = Image.fromarray(arr.astype(np.uint8))
+        if random.random() > 0.4:
+            img = img.filter(ImageFilter.GaussianBlur(
+                radius=random.uniform(0.2, 0.9)))
         return _normalise(_to_tensor(img))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DATA LOADERS
+#  DATA LOADER CONSTRUCTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _collate_skip_zero(batch):
+    """Drop label-0 (blank) samples — we never classify blank cells."""
     batch = [(img, lbl) for img, lbl in batch if lbl != 0]
     if not batch:
-        return torch.zeros(1,1,28,28), torch.zeros(1,dtype=torch.long)
+        return torch.zeros(1, 1, 28, 28), torch.zeros(1, dtype=torch.long)
     imgs, lbls = zip(*batch)
     return torch.stack(imgs), torch.tensor(lbls, dtype=torch.long)
 
 
-def _load_mnist(train: bool):
-    return datasets.MNIST(_DATA, train=train, download=True,
-                          transform=transforms.ToTensor())
-
-
-def _get_loaders():
+def _build_loaders():
     os.makedirs(_DATA, exist_ok=True)
 
-    # PRIMARY: TelegraphOCR — trains on exact OCR binarisation output
-    # 7 copies × 6000 samples × 9 digits = 378,000 samples
-    telegraph_ocr = ConcatDataset([
-        TelegraphOCRDataset(6000) for _ in range(7)
-    ])
+    # ── Primary: binarised Telegraph-style renders ─────────────────────────────
+    # 10 independent copies × SPD samples × 9 digits
+    tel_ocr  = ConcatDataset([TelegraphOCRDataset(SPD) for _ in range(10)])
 
-    # SECONDARY: TelegraphFont — rendered + degraded but no OCR binarise step
-    # 4 copies × 6000 × 9 = 216,000 samples
-    telegraph_font = ConcatDataset([
-        TelegraphFontDataset(6000) for _ in range(4)
-    ])
+    # ── Secondary: raw degraded Telegraph-style renders ────────────────────────
+    tel_font = ConcatDataset([TelegraphFontDataset(SPD) for _ in range(5)])
 
-    # MNIST-based augmentations for variety
-    mnist_tr = _load_mnist(True)
-    mnist_base   = InvertedMNISTDataset(mnist_tr)
-    mnist_hard1  = InvertedMNISTDataset(mnist_tr, HardPairTransform())
-    mnist_hard2  = InvertedMNISTDataset(mnist_tr, HardPairTransform())
-    mnist_hard3  = InvertedMNISTDataset(mnist_tr, HardPairTransform())
-    mnist_persp1 = InvertedMNISTDataset(mnist_tr, PerspectiveTransform())
-    mnist_persp2 = InvertedMNISTDataset(mnist_tr, PerspectiveTransform())
-    mnist_geo    = InvertedMNISTDataset(mnist_tr, GeometricTransform())
-    mnist_noise  = InvertedMNISTDataset(mnist_tr, NoiseTransform())
+    # ── MNIST augmentation variants ────────────────────────────────────────────
+    mnist_tr = datasets.MNIST(_DATA, train=True, download=True,
+                               transform=transforms.ToTensor())
+
+    base    = _InvertedMNIST(mnist_tr)                          # ×1 ~60k
+    hard1   = _InvertedMNIST(mnist_tr, _HardPairTransform())   # ×4 ~240k
+    hard2   = _InvertedMNIST(mnist_tr, _HardPairTransform())
+    hard3   = _InvertedMNIST(mnist_tr, _HardPairTransform())
+    hard4   = _InvertedMNIST(mnist_tr, _HardPairTransform())
+    persp1  = _InvertedMNIST(mnist_tr, _PerspectiveTransform())# ×2 ~120k
+    persp2  = _InvertedMNIST(mnist_tr, _PerspectiveTransform())
+    noise1  = _InvertedMNIST(mnist_tr, _NoiseTransform())      # ×2 ~120k
+    noise2  = _InvertedMNIST(mnist_tr, _NoiseTransform())
 
     train_ds = ConcatDataset([
-        telegraph_ocr,   # 378k  ← PRIMARY (trains on exact inference pipeline)
-        telegraph_font,  # 216k  ← SECONDARY
-        mnist_base,      #  60k  variety
-        mnist_hard1, mnist_hard2, mnist_hard3,  # 180k confusion pairs
-        mnist_persp1, mnist_persp2,              # 120k perspective
-        mnist_geo,       #  60k  geometric
-        mnist_noise,     #  60k  noise
-    ])
+        tel_ocr,                                     # PRIMARY  ~720k
+        tel_font,                                    # SECONDARY ~360k
+        base,                                        # MNIST base ~60k
+        hard1, hard2, hard3, hard4,                  # confusion pairs ~240k
+        persp1, persp2,                              # perspective ~120k
+        noise1, noise2,                              # noise ~120k
+    ])                                               # TOTAL  ~1.62M
 
-    test_ds = InvertedMNISTDataset(_load_mnist(False))
+    test_ds = _InvertedMNIST(
+        datasets.MNIST(_DATA, train=False, download=True,
+                        transform=transforms.ToTensor()))
 
-    use_cuda = torch.cuda.is_available()
-    nw = 4 if use_cuda else 0
-    kw = dict(batch_size=BATCH_SIZE, num_workers=nw,
-              pin_memory=use_cuda, collate_fn=_collate_skip_zero)
-    if nw > 0: kw["persistent_workers"] = True
+    cuda = torch.cuda.is_available()
+    nw   = min(4, os.cpu_count() or 1) if cuda else 0
+    kw   = dict(batch_size=BATCH_SIZE, num_workers=nw,
+                pin_memory=cuda, collate_fn=_collate_skip_zero)
+    if nw > 0:
+        kw["persistent_workers"] = True
 
     return (DataLoader(train_ds, shuffle=True,  **kw),
             DataLoader(test_ds,  shuffle=False, **kw))
@@ -650,111 +561,125 @@ def _get_loaders():
 
 def train():
     print(f"\n{'='*68}")
-    print(f"  DigitCNN v3 — Telegraph Newspaper Sudoku (Residual Edition)")
+    print(f"  DigitCNN — Telegraph Sudoku OCR  |  Custom CNN + SE Residual")
     print(f"{'='*68}")
     print(f"  Device   : {DEVICE}")
-    print(f"  Epochs   : {EPOCHS}  |  Batch: {BATCH_SIZE}")
+    print(f"  Epochs   : {EPOCHS}  |  Batch: {BATCH_SIZE}  |  LR: {LR}")
     print(f"  Norm     : mean={_MEAN[0]}  std={_STD[0]}")
-    print(f"  PRIMARY  : TelegraphOCR ×7 (exact inference binarisation)")
-    print(f"  SECONDRY : TelegraphFont ×4 + MNIST augs ×8")
-    if _FONTS:
-        print(f"  Fonts    : {[os.path.basename(f) for f in _FONTS]}")
-    else:
-        print(f"  Fonts    : NONE — using PIL default (install Liberation Sans!)")
+    print(f"  Fonts    : {[os.path.basename(f) for f in _FONTS] or 'PIL default'}")
     print(f"{'='*68}\n")
 
     os.makedirs(_WDIR, exist_ok=True)
-    model     = DigitCNN().to(DEVICE)
 
-    # Count parameters
+    model   = DigitCNN().to(DEVICE)
     nparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Model parameters: {nparams:,}\n")
+    print(f"  Parameters: {nparams:,}\n")
 
-    # Label smoothing reduces overconfidence on ambiguous cells
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.08)
+    # ── Loss: label smoothing avoids overconfident predictions on ambiguous cells
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.10)
 
-    # AdamW with cosine annealing + warm-up
+    # ── Optimiser: AdamW with weight decay for L2 regularisation
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=3e-4)
-    # Warm-up for 5 epochs then cosine anneal
-    def lr_lambda(epoch):
-        if epoch < 5: return (epoch + 1) / 5
-        return 0.5 * (1 + np.cos(np.pi * (epoch - 5) / (EPOCHS - 5)))
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # ── Schedule: linear warm-up → cosine annealing
+    def _lr_lambda(epoch: int) -> float:
+        if epoch < WARMUP_EP:
+            return (epoch + 1) / WARMUP_EP
+        t = (epoch - WARMUP_EP) / max(1, EPOCHS - WARMUP_EP)
+        return 0.5 * (1.0 + np.cos(np.pi * t))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+    # ── Mixed precision (CUDA only)
     use_amp = torch.cuda.is_available()
     scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
-    if use_amp: torch.backends.cudnn.benchmark = True
+    if use_amp:
+        torch.backends.cudnn.benchmark = True
 
-    train_loader, test_loader = _get_loaders()
+    train_loader, test_loader = _build_loaders()
     best_acc = 0.0
 
     for epoch in range(1, EPOCHS + 1):
-        # ── Train ──────────────────────────────────────────────────────────────
+
+        # ── Training pass ──────────────────────────────────────────────────────
         model.train()
         t_loss = t_correct = t_total = 0
+
         for imgs, labels in train_loader:
-            if imgs.shape[0] == 0: continue
+            if imgs.shape[0] == 0:
+                continue
             imgs   = imgs.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
+
             optimizer.zero_grad(set_to_none=True)
+
             with torch.cuda.amp.autocast(enabled=use_amp):
-                out  = model(imgs)
-                loss = criterion(out, labels)
+                logits = model(imgs)
+                loss   = criterion(logits, labels)
+
             scaler.scale(loss).backward()
-            # Gradient clipping — stabilises training on noisy batches
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-            scaler.step(optimizer); scaler.update()
+            scaler.step(optimizer)
+            scaler.update()
+
             t_loss    += loss.item() * imgs.size(0)
-            t_correct += (out.argmax(1) == labels).sum().item()
+            t_correct += (logits.argmax(1) == labels).sum().item()
             t_total   += imgs.size(0)
 
-        # ── Validate ───────────────────────────────────────────────────────────
+        # ── Validation pass ────────────────────────────────────────────────────
         model.eval()
         v_correct = v_total = 0
-        # Per-class accuracy tracking
-        class_correct = {d: 0 for d in range(1, 10)}
-        class_total   = {d: 0 for d in range(1, 10)}
+        cls_ok    = {d: 0 for d in range(1, 10)}
+        cls_tot   = {d: 0 for d in range(1, 10)}
+
         with torch.no_grad():
             for imgs, labels in test_loader:
-                if imgs.shape[0] == 0: continue
+                if imgs.shape[0] == 0:
+                    continue
                 imgs   = imgs.to(DEVICE, non_blocking=True)
                 labels = labels.to(DEVICE, non_blocking=True)
                 preds  = model(imgs).argmax(1)
+
                 v_correct += (preds == labels).sum().item()
                 v_total   += imgs.size(0)
+
                 for d in range(1, 10):
                     mask = (labels == d)
-                    class_correct[d] += (preds[mask] == d).sum().item()
-                    class_total[d]   += mask.sum().item()
+                    cls_ok[d]  += (preds[mask] == d).sum().item()
+                    cls_tot[d] += mask.sum().item()
 
-        val_acc   = v_correct / v_total * 100 if v_total else 0
-        train_acc = t_correct / t_total * 100 if t_total else 0
+        val_acc   = v_correct / max(v_total, 1) * 100
+        train_acc = t_correct / max(t_total, 1) * 100
         cur_lr    = scheduler.get_last_lr()[0]
-        print(f"  Ep {epoch:02d}/{EPOCHS}  "
+
+        print(f"  Ep {epoch:03d}/{EPOCHS}  "
               f"loss={t_loss/max(t_total,1):.4f}  "
               f"train={train_acc:.1f}%  val={val_acc:.2f}%  "
               f"lr={cur_lr:.2e}")
 
-        # Print per-class accuracy every 10 epochs to spot problem digits
+        # Per-class accuracy every 10 epochs — spot weak digits immediately
         if epoch % 10 == 0 or epoch == EPOCHS:
-            class_str = "  Per-class val: " + "  ".join(
-                f"{d}={class_correct[d]/max(class_total[d],1)*100:.0f}%"
+            row = "  Per-digit: " + "  ".join(
+                f"{d}={cls_ok[d]/max(cls_tot[d],1)*100:.0f}%"
                 for d in range(1, 10))
-            print(class_str)
+            print(row)
 
         scheduler.step()
+
+        # Save last checkpoint every epoch
         torch.save(model.state_dict(), _LAST)
 
+        # Save best checkpoint
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), _BEST)
-            print(f"    ✓ Best saved  (val={val_acc:.2f}%)")
+            print(f"    ✓ New best  val={val_acc:.2f}%  → saved to {_BEST}")
 
-    print(f"\n  Done.  Best val accuracy: {best_acc:.2f}%")
-    print(f"  Weights saved to: {_BEST}")
-    print(f"\n  Now copy model.py (updated DigitCNN class) to backend/model.py")
-    print(f"  and restart the server.\n")
+    print(f"\n{'='*68}")
+    print(f"  Training complete.  Best validation accuracy: {best_acc:.2f}%")
+    print(f"  Weights saved: {_BEST}")
+    print(f"{'='*68}\n")
 
 
 if __name__ == "__main__":
